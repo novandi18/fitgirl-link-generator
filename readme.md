@@ -109,6 +109,6 @@ If you encounter issues:
 
 This tool is for educational purposes only. Please respect copyright laws and support game developers by purchasing games you enjoy. FitGirl repacks should only be used to try games before purchasing or to download games you already own.
 
-## Licence
+## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
