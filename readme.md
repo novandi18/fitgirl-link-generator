@@ -37,6 +37,7 @@ source venv/bin/activate
 
 ```
 pip install playwright requests beautifulsoup4 playwright-stealth
+pip install --upgrade setuptools
 ```
 
 4. Install Playwright browsers:
