@@ -128,6 +128,9 @@ You can modify the `download_util.py` file to change browser behavior:
 
 The success message displayed after completion ("Download selesai") is in Indonesian. This means "Download completed".
 
+## Demo on Web
+[https://fitgirl-link-generator-1098613385318.asia-southeast2.run.app/](https://fitgirl-link-generator-1098613385318.asia-southeast2.run.app/)
+
 ## Troubleshooting
 
 If you encounter issues:
