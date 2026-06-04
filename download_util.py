@@ -1,10 +1,18 @@
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth
 import asyncio
 import random
 import logging
+import re
+import requests as req
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Matches both fuckingfast.co/dl/ and dl.fuckingfast.co/dl/ (handles subdomain changes)
+DOWNLOAD_LINK_PATTERN = re.compile(r'window\.open\("(https://[^"]*fuckingfast\.co/dl/[^"]+)"')
+
+RATE_LIMIT_KEYWORDS = ('rate limited', 'rate limit', 'too many requests')
+
 
 async def get_final_download_fuckingfast_async(url: str, max_retries: int = 3) -> str:
     """Get the final download link with retry mechanism for rate limiting"""
@@ -38,8 +46,41 @@ class RateLimitedException(Exception):
     pass
 
 
+def _fetch_page_html(url: str) -> str | None:
+    """Fetch page HTML using a plain HTTP request (fast path)"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Referer': 'https://fitgirl-repacks.site/',
+    }
+    try:
+        response = req.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            return response.text
+    except Exception:
+        pass
+    return None
+
+
 async def _extract_download_link(url: str) -> str:
-    """Internal function to extract download link with improved stealth"""
+    """Extract download link: tries plain HTTP first, falls back to Playwright"""
+    loop = asyncio.get_event_loop()
+    html = await loop.run_in_executor(None, _fetch_page_html, url)
+
+    if html:
+        lower = html.lower()
+        if any(kw in lower for kw in RATE_LIMIT_KEYWORDS):
+            raise RateLimitedException("Rate limiting detected")
+        match = DOWNLOAD_LINK_PATTERN.search(html)
+        if match:
+            return match.group(1)
+
+    return await _extract_download_link_playwright(url)
+
+
+async def _extract_download_link_playwright(url: str) -> str:
+    """Fallback: extract download link using Playwright with stealth"""
     async with async_playwright() as p:
         width = random.randint(1280, 1920)
         height = random.randint(800, 1080)
@@ -61,16 +102,12 @@ async def _extract_download_link(url: str) -> str:
         )
         
         page = await context.new_page()
-        
-        await stealth_async(page)
-        
+        await Stealth().apply_stealth_async(page)
         await asyncio.sleep(random.uniform(0.5, 1.5))
         
         try:
-            # Navigate with extended timeout
             await page.goto(url, wait_until='networkidle', timeout=60000)
             
-            # Check for rate limiting
             rate_limited = await page.evaluate("""() => {
                 return document.body.textContent.includes('rate limited') || 
                     document.body.textContent.includes('Rate Limit') ||
@@ -81,47 +118,16 @@ async def _extract_download_link(url: str) -> str:
                 await browser.close()
                 raise RateLimitedException("Rate limiting detected")
             
-            # Add slight delay to let any scripts initialize
             await asyncio.sleep(random.uniform(1, 2))
-            
-            download_link = await page.evaluate("""() => {
-                const scripts = document.querySelectorAll('script');
-                let dlLink = null;
-                
-                for (const script of scripts) {
-                    const content = script.textContent || script.innerText;
-                    if (!content) continue;
-                    
-                    if (content.includes('function download()')) {
-                        // Try multiple regex patterns
-                        let match = content.match(/window\\.open\\("(https:\\/\\/fuckingfast\\.co\\/dl\\/[^"]+)"/);
-                        if (!match) {
-                            match = content.match(/window\.open\("(https:\/\/fuckingfast\.co\/dl\/[^"]+)"/);
-                        }
-                        if (match && match[1]) {
-                            dlLink = match[1];
-                            break;
-                        }
-                    }
-                }
 
-                // Fallback: look for download button or direct link
-                if (!dlLink) {
-                    const downloadBtns = [...document.querySelectorAll('a[href*="fuckingfast.co/dl/"]')];
-                    if (downloadBtns.length > 0) {
-                        dlLink = downloadBtns[0].href;
-                    }
-                }
-
-                return dlLink;
-            }""")
-            
+            html = await page.content()
             await browser.close()
-            
-            if not download_link:
-                return "Download link not found"
-                
-            return download_link
+
+            match = DOWNLOAD_LINK_PATTERN.search(html)
+            if match:
+                return match.group(1)
+
+            return "Download link not found"
             
         except RateLimitedException:
             await browser.close()
