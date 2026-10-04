@@ -4,13 +4,19 @@ import asyncio
 from bs4 import BeautifulSoup
 import re
 import os
-import time
-from download_util import get_final_download_fuckingfast_async
+import sys
+from download_util import (
+    get_final_download_fuckingfast_async,
+    process_fuckingfast_links_batch,
+)
 
 
 def extract_links(url, exclude_bonus=False, exclude_language=False):
-    """Extract FuckingFast download links from the webpage"""
-    response = requests.get(url)
+    """Extract FuckingFast download links from the FitGirl repack webpage"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
+    response = requests.get(url, headers=headers)
     if response.status_code != 200:
         print(f"Failed to retrieve the page: {response.status_code}")
         return []
@@ -30,58 +36,60 @@ def extract_links(url, exclude_bonus=False, exclude_language=False):
     return links
 
 
-async def process_links_async(links):
-    tasks = [get_final_download_fuckingfast_async(link) for link in links]
-    return await asyncio.gather(*tasks)
-
-
 async def async_main():
-    parser = argparse.ArgumentParser(description='Generate download links from FitGirl repacks')
-    parser.add_argument('--url', type=str, required=True,
+    parser = argparse.ArgumentParser(description='Generate direct download links from FitGirl repacks & FuckingFast')
+    parser.add_argument('--url', type=str,
                         help='FitGirl repack URL to extract download links from')
+    parser.add_argument('--file', type=str,
+                        help='Path to a text file containing FuckingFast links (one per line)')
     parser.add_argument('--noBonus', action='store_true',
                         help='Exclude bonus content links (files starting with "fg-optional")')
     parser.add_argument('--noLanguage', action='store_true',
                         help='Exclude selective language links (files starting with "fg-selective" and ending with ".bin")')
     args = parser.parse_args()
     
-    url = args.url
-    exclude_bonus = args.noBonus
-    exclude_language = args.noLanguage
-    
-    links = extract_links(url, exclude_bonus, exclude_language)
-    
+    if not args.url and not args.file:
+        parser.error("Either --url or --file must be specified.")
+
+    links = []
+    output_prefix = "fitgirl"
+
+    if args.url:
+        print(f"Fetching repack page: {args.url}")
+        links = extract_links(args.url, args.noBonus, args.noLanguage)
+        output_prefix = args.url.rstrip('/').split('/')[-1]
+    elif args.file:
+        print(f"Reading links from file: {args.file}")
+        with open(args.file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("http"):
+                    links.append(line)
+        output_prefix = os.path.splitext(os.path.basename(args.file))[0]
+
     if not links:
-        print("No FuckingFast links found")
+        print("No FuckingFast links found to process.")
         return
     
-    print(f"Downloading {len(links)} files...")
+    print(f"Processing {len(links)} links with browser automation...")
     
     try:
-        final_links = await process_links_async(links)
-        
-        rate_limited_links = [link for link in final_links if "Rate limit error" in link]
-        if rate_limited_links:
-            print("Process cancelled due to rate limiting. Please try again later.")
-            return
-        
-        error_links = [link for link in final_links if link.startswith("Error:") or link == "Download link not found"]
-        if error_links:
-            print(f"Warning: {len(error_links)} links could not be processed.")
-        
-        game_name = url.rstrip('/').split('/')[-1]
+        final_links = await process_fuckingfast_links_batch(links)
         
         output_dir = os.path.join(os.getcwd(), "output")
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"{output_prefix}_links.txt")
         
-        output_file = os.path.join(output_dir, f"{game_name}_fitgirl_links.txt")
-        with open(output_file, 'w') as f:
+        success_count = 0
+        with open(output_file, 'w', encoding='utf-8') as f:
             for link in final_links:
-                if not (link.startswith("Error:") or link == "Download link not found" or "Rate limit error" in link):
+                if link and not (link.startswith("Error:") or link == "Download link not found" or "Rate limit error" in link):
                     f.write(f"{link}\n")
+                    success_count += 1
         
-        print(f"Download selesai, {output_file}")
+        print(f"\nCompleted: {success_count}/{len(links)} direct links extracted successfully.")
+        print(f"Saved to: {output_file}")
+        print("Ready for IDM import: Tasks -> Import -> From text file")
     
     except Exception as e:
         print(f"Error processing links: {e}")
