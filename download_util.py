@@ -1,5 +1,6 @@
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
+from typing import Callable
 from urllib.parse import urljoin
 import asyncio
 import random
@@ -12,6 +13,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Matches both fuckingfast.co/dl/ and dl.fuckingfast.co/dl/
 DOWNLOAD_LINK_PATTERN = re.compile(r'window\.open\(["\'](https://[^"\']*fuckingfast\.co/dl/[^"\']+)["\']')
 RATE_LIMIT_KEYWORDS = ('rate limited', 'rate limit', 'too many requests')
+PART_SUFFIX_PATTERN = re.compile(r'^(.*?)(?:\.part(\d+))?\.(rar|bin|7z|zip|exe)$', re.IGNORECASE)
 
 # Default parallel browser tabs (balanced for speed vs Cloudflare/FuckingFast rate limits)
 DEFAULT_CONCURRENCY = 3
@@ -45,10 +47,11 @@ def is_valid_direct_link(link: str | None) -> bool:
 def sort_fuckingfast_links(links: list[str]) -> list[str]:
     """
     Deduplicate and naturally sort FuckingFast links so multi-part archives
-    (e.g. part1.rar .. part8.rar .. part10.rar) stay strictly in part order.
+    (e.g. part1.rar .. part8.rar .. part10.rar) stay strictly in part order,
+    while preserving the relative order of distinct archive groups (important for updates).
     Links without a #filename fragment preserve their original relative order.
     """
-    seen = set()
+    seen: set[str] = set()
     unique_links: list[str] = []
     for link in links:
         base = link.split('#', 1)[0].strip()
@@ -56,13 +59,17 @@ def sort_fuckingfast_links(links: list[str]) -> list[str]:
             seen.add(base)
             unique_links.append(link.strip())
 
-    def _sort_key(item: tuple[int, str]):
-        idx, url = item
+    # Track the first appearance index of each base archive name so distinct archives
+    # (e.g. sequential game updates) stay in their chronological order while their
+    # individual parts (.part1.rar, .part2.rar, ...) are sorted numerically.
+    base_first_seen: dict[tuple[int, str], int] = {}
+
+    def _parse_fragment_meta(idx: int, url: str):
         if '#' not in url:
-            return (3, [], idx)
+            return (3, idx, 0, [], idx)
         fragment = url.split('#', 1)[1].strip()
         if not fragment:
-            return (3, [], idx)
+            return (3, idx, 0, [], idx)
 
         lower_frag = fragment.lower()
         if 'fg-optional' in lower_frag:
@@ -72,16 +79,31 @@ def sort_fuckingfast_links(links: list[str]) -> list[str]:
         else:
             category = 0
 
+        m = PART_SUFFIX_PATTERN.match(lower_frag)
+        if m:
+            base_name = m.group(1)
+            part_num = int(m.group(2)) if m.group(2) is not None else 0
+        else:
+            base_name = lower_frag
+            part_num = 0
+
+        group_key = (category, base_name)
+        if group_key not in base_first_seen:
+            base_first_seen[group_key] = idx
+        group_order = base_first_seen[group_key]
+
         # Tuple-tag ints vs strings to prevent TypeError during comparison in Python 3
         natural_parts = [
             (0, int(tok)) if tok.isdigit() else (1, tok)
             for tok in re.split(r'(\d+)', lower_frag)
             if tok
         ]
-        return (category, natural_parts, idx)
+        return (category, group_order, part_num, natural_parts, idx)
 
     indexed = list(enumerate(unique_links))
-    indexed.sort(key=_sort_key)
+    # Pre-populate base_first_seen in original order
+    keys = {i: _parse_fragment_meta(i, u) for i, u in indexed}
+    indexed.sort(key=lambda item: keys[item[0]])
     return [url for _, url in indexed]
 
 
@@ -304,10 +326,15 @@ class FuckingFastBatchExtractor:
         self._pages.append(new_page)
         return new_page
 
-    async def process_links(self, links: list[str]) -> list[str]:
+    async def process_links(
+        self,
+        links: list[str],
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> list[str]:
         """
         Extract direct download URLs concurrently across pooled tabs.
         Returns results strictly aligned with the input `links` order.
+        Optionally calls `on_progress(source_link, direct_link)` on each resolved link.
         """
         if not links:
             return []
@@ -334,6 +361,11 @@ class FuckingFastBatchExtractor:
                         if is_valid_direct_link(direct):
                             completed += 1
                             logging.info(f"[{completed}/{total} done] Part {idx + 1} OK: {label}")
+                            if on_progress is not None:
+                                try:
+                                    on_progress(link, direct)
+                                except Exception as cb_err:
+                                    logging.debug(f"Progress callback error: {cb_err}")
                             return direct
 
                         if attempt < self.max_retries:
@@ -456,6 +488,7 @@ async def process_fuckingfast_links_batch(
     links: list[str],
     concurrency: int = DEFAULT_CONCURRENCY,
     max_retries: int = 3,
+    on_progress: Callable[[str, str], None] | None = None,
 ) -> list[str]:
     """
     Concurrent batch processor that reuses a single stealth browser session
@@ -465,4 +498,4 @@ async def process_fuckingfast_links_batch(
         return []
 
     async with FuckingFastBatchExtractor(concurrency=concurrency, max_retries=max_retries) as extractor:
-        return await extractor.process_links(links)
+        return await extractor.process_links(links, on_progress=on_progress)
