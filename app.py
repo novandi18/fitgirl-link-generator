@@ -3,6 +3,8 @@ import asyncio
 import json
 import os
 import re
+import sys
+import time
 from datetime import datetime, timezone
 from urllib.parse import quote_plus, urlparse
 import requests
@@ -10,11 +12,39 @@ from bs4 import BeautifulSoup
 from download_util import (
     DEFAULT_CONCURRENCY,
     FuckingFastBatchExtractor,
+    format_part_label,
+    friendly_error_message,
     get_final_download_fuckingfast_async,
     is_valid_direct_link,
     process_fuckingfast_links_batch,
+    set_verbose_logging,
     sort_fuckingfast_links,
 )
+
+# Optional Rich library support with built-in ANSI/Unicode fallback
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeRemainingColumn,
+    )
+    from rich.table import Table
+    from rich import box
+    HAS_RICH = True
+    _CONSOLE = Console()
+except ImportError:
+    HAS_RICH = False
+    _CONSOLE = None
+
+# Enable ANSI escape sequences on Windows terminals when using fallback renderer
+if os.name == "nt":
+    os.system("")
 
 HEADERS = {
     'User-Agent': (
@@ -30,7 +60,7 @@ NON_GAME_SLUGS = {
     'contacts',
     'all-my-repacks-a-z',
     'popular-repacks',
-    ' popular-repacks-of-the-year',
+    'popular-repacks-of-the-year',
 }
 
 NON_GAME_TITLE_PREFIXES = (
@@ -42,6 +72,238 @@ NON_GAME_TITLE_PREFIXES = (
     'faq',
 )
 
+
+# ---------------------------------------------------------------------------
+# Clean CLI UI Helper (Uses `rich` if installed, or clean ANSI/Unicode fallback)
+# ---------------------------------------------------------------------------
+
+class CLIUI:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    MAGENTA = "\033[95m"
+
+    @classmethod
+    def banner(cls):
+        title = "FitGirl Direct Link Generator"
+        subtitle = "Fast, automatic direct download link extractor for IDM & JDownloader"
+        if HAS_RICH:
+            _CONSOLE.print()
+            _CONSOLE.print(
+                Panel(
+                    f"[bold cyan]{title}[/bold cyan]\n[dim]{subtitle}[/dim]",
+                    border_style="cyan",
+                    box=box.ROUNDED,
+                    padding=(0, 2),
+                )
+            )
+        else:
+            width = max(len(title), len(subtitle)) + 4
+            print(f"\n{cls.CYAN}╭{'─' * width}╮{cls.RESET}")
+            print(f"{cls.CYAN}│{cls.RESET}  {cls.BOLD}{cls.CYAN}{title.ljust(width - 2)}{cls.RESET}{cls.CYAN}│{cls.RESET}")
+            print(f"{cls.CYAN}│{cls.RESET}  {cls.DIM}{subtitle.ljust(width - 2)}{cls.RESET}{cls.CYAN}│{cls.RESET}")
+            print(f"{cls.CYAN}╰{'─' * width}╯{cls.RESET}")
+
+    @classmethod
+    def info(cls, msg: str):
+        if HAS_RICH:
+            _CONSOLE.print(f"[cyan]ℹ[/cyan] {msg}")
+        else:
+            print(f"{cls.CYAN}ℹ{cls.RESET} {msg}")
+
+    @classmethod
+    def success(cls, msg: str):
+        if HAS_RICH:
+            _CONSOLE.print(f"[bold green]✔[/bold green] {msg}")
+        else:
+            print(f"{cls.GREEN}✔{cls.RESET} {msg}")
+
+    @classmethod
+    def warn(cls, msg: str):
+        if HAS_RICH:
+            _CONSOLE.print(f"[bold yellow]⚠[/bold yellow] [yellow]{msg}[/yellow]")
+        else:
+            print(f"{cls.YELLOW}⚠ {msg}{cls.RESET}")
+
+    @classmethod
+    def error(cls, msg: str):
+        if HAS_RICH:
+            _CONSOLE.print(f"[bold red]✖[/bold red] [red]{msg}[/red]")
+        else:
+            print(f"{cls.RED}✖ {msg}{cls.RESET}")
+
+    @classmethod
+    def section(cls, title: str):
+        if HAS_RICH:
+            _CONSOLE.print(f"\n[bold magenta]━━ {title} ━━[/bold magenta]")
+        else:
+            print(f"\n{cls.BOLD}{cls.MAGENTA}━━ {title} ━━{cls.RESET}")
+
+    @classmethod
+    def search_results_table(cls, query: str, results: list[dict[str, str]]):
+        if HAS_RICH:
+            table = Table(
+                title=f"Search Results for '{query}' ({len(results)} found)",
+                box=box.ROUNDED,
+                border_style="cyan",
+                header_style="bold cyan",
+                show_lines=False,
+            )
+            table.add_column("#", style="bold yellow", justify="right", width=4)
+            table.add_column("Game Title", style="bold white")
+            table.add_column("Release Date", style="dim", width=16)
+            for idx, item in enumerate(results, 1):
+                table.add_row(str(idx), item["title"], item.get("date") or "-")
+            _CONSOLE.print()
+            _CONSOLE.print(table)
+        else:
+            print(f"\n{cls.BOLD}{cls.CYAN}Search Results for '{query}' ({len(results)} found):{cls.RESET}")
+            print(f"{cls.DIM}{'─' * 72}{cls.RESET}")
+            for idx, item in enumerate(results, 1):
+                date_str = f" ({item['date']})" if item.get("date") else ""
+                print(f"  {cls.YELLOW}[{idx}]{cls.RESET} {cls.BOLD}{item['title']}{cls.RESET}{cls.DIM}{date_str}{cls.RESET}")
+                print(f"      {cls.DIM}{item['url']}{cls.RESET}")
+            print(f"{cls.DIM}{'─' * 72}{cls.RESET}")
+
+    @classmethod
+    def summary_table(cls, summary_rows: list[tuple[str, int, int, str]]):
+        if HAS_RICH:
+            table = Table(
+                title="Download Links Summary",
+                box=box.ROUNDED,
+                border_style="green",
+                header_style="bold green",
+            )
+            table.add_column("Game / Source", style="bold white")
+            table.add_column("Files Ready", justify="center")
+            table.add_column("Saved Text File", style="cyan")
+            for label, ok_cnt, total_cnt, out_path in summary_rows:
+                status_style = "bold green" if ok_cnt == total_cnt else ("bold yellow" if ok_cnt > 0 else "bold red")
+                table.add_row(label, f"[{status_style}]{ok_cnt}/{total_cnt}[/{status_style}]", out_path)
+            _CONSOLE.print()
+            _CONSOLE.print(table)
+        else:
+            print(f"\n{cls.BOLD}{cls.GREEN}━━ Download Links Summary ━━{cls.RESET}")
+            for label, ok_cnt, total_cnt, out_path in summary_rows:
+                color = cls.GREEN if ok_cnt == total_cnt else (cls.YELLOW if ok_cnt > 0 else cls.RED)
+                print(f"  • {cls.BOLD}{label}{cls.RESET}: {color}{ok_cnt}/{total_cnt} files ready{cls.RESET} -> {cls.CYAN}{out_path}{cls.RESET}")
+
+    @classmethod
+    def idm_guide_box(cls):
+        steps = (
+            "1. Open Internet Download Manager (IDM)\n"
+            "2. Click menu: Tasks -> Import -> From text file\n"
+            "3. Choose your generated .txt file inside the 'output' folder\n"
+            "4. Click 'Check All' -> 'OK' to start downloading!"
+        )
+        if HAS_RICH:
+            _CONSOLE.print()
+            _CONSOLE.print(
+                Panel(
+                    steps,
+                    title="[bold green]Next Step: How to Download with IDM[/bold green]",
+                    border_style="green",
+                    box=box.ROUNDED,
+                    padding=(0, 2),
+                )
+            )
+        else:
+            print(f"\n{cls.GREEN}╭── Next Step: How to Download with IDM ──────────────────────────╮{cls.RESET}")
+            for line in steps.splitlines():
+                print(f"{cls.GREEN}│{cls.RESET}  {line.ljust(63)}{cls.GREEN}│{cls.RESET}")
+            print(f"{cls.GREEN}╰─────────────────────────────────────────────────────────────────╯{cls.RESET}")
+
+
+class LiveExtractionProgress:
+    """
+    Context manager that renders a live progress bar during async extraction.
+    Uses `rich.progress.Progress` when available, or a clean single-line ANSI bar.
+    """
+
+    def __init__(self, total: int, initial_completed: int = 0):
+        self.total = max(1, total)
+        self.completed = initial_completed
+        self.status_text = "Starting..."
+        self._rich_progress = None
+        self._task_id = None
+        self._start_time = time.time()
+
+    def __enter__(self):
+        if HAS_RICH:
+            self._rich_progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[bold cyan]{task.description}[/bold cyan]"),
+                BarColumn(bar_width=28),
+                MofNCompleteColumn(),
+                TaskProgressColumn(),
+                TimeRemainingColumn(),
+                TextColumn("[dim]{task.fields[status]}[/dim]"),
+                console=_CONSOLE,
+                transient=False,
+            )
+            self._rich_progress.__enter__()
+            self._task_id = self._rich_progress.add_task(
+                "Fetching links",
+                total=self.total,
+                completed=self.completed,
+                status=self.status_text,
+            )
+        else:
+            self._render_ansi()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if HAS_RICH and self._rich_progress is not None:
+            self._rich_progress.update(self._task_id, status="Done")
+            self._rich_progress.__exit__(exc_type, exc, tb)
+        else:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    def on_status(self, event: str, part_num: int, total_pending: int, message: str):
+        if event in ("done", "failed"):
+            self.completed += 1
+            if event == "done":
+                self.status_text = f"Ready: {message}"
+            else:
+                self.status_text = f"Failed: {message}"
+        elif event == "rate_limit":
+            self.status_text = message
+        elif event == "retry":
+            self.status_text = message
+        else:
+            self.status_text = f"Working on {message}..."
+
+        if HAS_RICH and self._rich_progress is not None:
+            self._rich_progress.update(
+                self._task_id,
+                completed=self.completed,
+                status=self.status_text,
+            )
+        else:
+            self._render_ansi()
+
+    def _render_ansi(self):
+        pct = min(100, int((self.completed / self.total) * 100))
+        bar_len = 22
+        filled = int((self.completed / self.total) * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        short_status = self.status_text[:44].ljust(44)
+        line = (
+            f"\r  {CLIUI.CYAN}[{bar}]{CLIUI.RESET} {CLIUI.BOLD}{pct:3d}%{CLIUI.RESET} "
+            f"({self.completed}/{self.total} files) • {CLIUI.DIM}{short_status}{CLIUI.RESET}"
+        )
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Core Link Scraping, Filtering & Search Functions
+# ---------------------------------------------------------------------------
 
 def _sanitize_filename(name: str) -> str:
     """Sanitize a string to be safe as a Windows/POSIX filename prefix."""
@@ -93,7 +355,6 @@ def _matches_language_filter(
 
     if allowed_langs:
         after_selective = lower_href.split('fg-selective-', 1)[-1]
-        # Strip file extensions (.part1.rar, .rar, .bin, etc.) to inspect language tokens
         lang_segment = re.sub(r'(?:\.part\d+)?\.(?:rar|bin|7z|zip)$', '', after_selective)
         lang_tokens = [t for t in re.split(r'[^a-z0-9]+', lang_segment) if t]
         for req_lang in allowed_langs:
@@ -128,7 +389,6 @@ def filter_fitgirl_links(
 
 def _is_in_updates_section(a_tag) -> bool:
     """Return True if an <a> tag belongs to the 'Game Updates' section on a FitGirl page."""
-    # 1. Check ancestor Shortcodes-Ultimate spoiler title
     spoiler = a_tag.find_parent(class_=re.compile(r'\bsu-spoiler\b'))
     if spoiler:
         title_el = spoiler.find(class_=re.compile(r'\bsu-spoiler-title\b'))
@@ -138,7 +398,6 @@ def _is_in_updates_section(a_tag) -> bool:
                 if 'download mirrors' not in title_text:
                     return True
 
-    # 2. Check nearest preceding heading or strong section header
     for prev in a_tag.find_all_previous(['h1', 'h2', 'h3', 'h4', 'h5', 'p']):
         text = prev.get_text(" ", strip=True).lower()
         if not text:
@@ -155,7 +414,6 @@ def _is_in_updates_section(a_tag) -> bool:
                 if 'game update' in s_text or 'updates – direct' in s_text or 'updates - direct' in s_text:
                     return True
 
-    # 3. Heuristic fallback: link does not have FitGirl main repack markers and sits in an Update <li>
     href = a_tag.get('href', '')
     lower_href = href.lower()
     is_main_repack_marker = (
@@ -247,11 +505,11 @@ def scrape_fitgirl_page(
     try:
         response = requests.get(url, headers=HEADERS, timeout=20)
     except requests.RequestException as e:
-        print(f"Failed to retrieve {url}: {e}")
+        CLIUI.error(f"Could not open page {url}: {friendly_error_message(str(e))}")
         return [], []
 
     if response.status_code != 200:
-        print(f"Failed to retrieve {url}: HTTP {response.status_code}")
+        CLIUI.error(f"Could not open page {url} (HTTP {response.status_code})")
         return [], []
 
     soup = BeautifulSoup(response.text, 'html.parser')
@@ -293,11 +551,11 @@ def search_fitgirl_games(query: str) -> list[dict[str, str]]:
     try:
         response = requests.get(search_url, headers=HEADERS, timeout=20)
     except requests.RequestException as e:
-        print(f"Search request failed: {e}")
+        CLIUI.error(f"Could not connect to FitGirl search: {friendly_error_message(str(e))}")
         return []
 
     if response.status_code != 200:
-        print(f"Search failed with HTTP {response.status_code}")
+        CLIUI.error(f"FitGirl search returned HTTP {response.status_code}")
         return []
 
     soup = BeautifulSoup(response.text, 'html.parser')
@@ -394,38 +652,35 @@ def parse_search_selection(selection: str, total: int) -> list[int] | None:
 
 def interactive_search_flow(query: str) -> list[str]:
     """Run interactive CLI search and return selected FitGirl repack URLs."""
-    print(f"Searching FitGirl Repacks for: \"{query}\"...")
+    CLIUI.info(f"Searching FitGirl Repacks for '{query}'...")
     results = search_fitgirl_games(query)
     if not results:
-        print(f"No game repacks found matching \"{query}\".")
+        CLIUI.warn(f"No games found matching '{query}'. Try a shorter keyword.")
         return []
 
-    print(f"\nFound {len(results)} result(s) for \"{query}\":")
-    for idx, item in enumerate(results, 1):
-        date_suffix = f" [{item['date']}]" if item.get('date') else ""
-        print(f"  [{idx}] {item['title']}{date_suffix}")
-        print(f"      {item['url']}")
+    CLIUI.search_results_table(query, results)
 
     for _ in range(3):
         try:
             prompt = (
-                f"\nSelect game number(s) (1-{len(results)}, e.g. 1 or 1,3 or 1-3 or 'all', 'q' to cancel): "
+                f"\nEnter game number(s) to download (1-{len(results)}, e.g. 1 or 1,3 or 'all', 'q' to cancel): "
             )
             answer = input(prompt)
         except (EOFError, KeyboardInterrupt):
-            print("\nSearch selection cancelled.")
+            print()
+            CLIUI.warn("Search cancelled.")
             return []
 
         selected_indices = parse_search_selection(answer, len(results))
         if selected_indices is None:
-            print(f"Invalid selection. Please enter number(s) between 1 and {len(results)}.")
+            CLIUI.warn(f"Please enter valid number(s) between 1 and {len(results)}.")
             continue
         if not selected_indices:
-            print("Search selection cancelled.")
+            CLIUI.info("Search cancelled.")
             return []
         return [results[i]['url'] for i in selected_indices]
 
-    print("Too many invalid attempts. Search cancelled.")
+    CLIUI.warn("Too many invalid attempts. Search cancelled.")
     return []
 
 
@@ -435,12 +690,16 @@ def _parse_url_inputs(raw_urls: list[str] | None) -> list[str]:
         return []
     parsed_urls: list[str] = []
     for item in raw_urls:
-        for part in item.split(','):
+        for part in re.split(r'[,\s]+', item):
             u = part.strip()
             if u.startswith("http"):
                 parsed_urls.append(u)
     return parsed_urls
 
+
+# ---------------------------------------------------------------------------
+# Checkpoint Management
+# ---------------------------------------------------------------------------
 
 def _checkpoint_path(output_dir: str, job_name: str) -> str:
     cache_dir = os.path.join(output_dir, ".cache")
@@ -466,11 +725,21 @@ def _load_checkpoint(path: str) -> dict[str, str]:
     return {}
 
 
-def _save_checkpoint(path: str, source_desc: str, resolved_map: dict[str, str]):
-    """Persist {clean_source_url: direct_url} checkpoint atomically."""
+def _save_checkpoint(
+    path: str,
+    source_desc: str,
+    resolved_map: dict[str, str],
+    all_links: list[str] | None = None,
+    job_stem: str | None = None,
+    desired_txt: str | None = None,
+):
+    """Persist checkpoint atomically so interrupted runs can be resumed easily."""
     payload = {
+        "job_stem": job_stem or "",
+        "desired_txt": desired_txt or "",
         "source": source_desc,
         "updated_at": datetime.now(timezone.utc).isoformat(),
+        "all_links": all_links or [],
         "resolved": resolved_map,
     }
     tmp_path = f"{path}.tmp"
@@ -482,9 +751,178 @@ def _save_checkpoint(path: str, source_desc: str, resolved_map: dict[str, str]):
         pass
 
 
+def _list_resumable_checkpoints(output_dir: str) -> list[dict]:
+    """Find saved checkpoints in output/.cache/ that can be resumed."""
+    cache_dir = os.path.join(output_dir, ".cache")
+    if not os.path.isdir(cache_dir):
+        return []
+    items: list[dict] = []
+    for fname in sorted(os.listdir(cache_dir)):
+        if not fname.endswith("_checkpoint.json"):
+            continue
+        fpath = os.path.join(cache_dir, fname)
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            all_links = data.get("all_links") or []
+            resolved = {
+                k: v for k, v in (data.get("resolved") or {}).items()
+                if is_valid_direct_link(v)
+            }
+            if not all_links:
+                continue
+            done_cnt = sum(1 for l in all_links if l.split('#', 1)[0].strip() in resolved)
+            items.append({
+                "job_stem": data.get("job_stem") or fname[:-16],
+                "desired_txt": data.get("desired_txt") or f"{fname[:-16]}.txt",
+                "source": data.get("source") or fname[:-16],
+                "all_links": all_links,
+                "done_count": done_cnt,
+                "total_count": len(all_links),
+            })
+        except Exception:
+            continue
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Interactive Beginner Wizard (When `python app.py` is run without arguments)
+# ---------------------------------------------------------------------------
+
+def _prompt_filter_preferences(args):
+    """Ask simple, optional filter questions in interactive mode."""
+    try:
+        lang_ans = input(
+            "\nLanguage pack filter (e.g. 'english', 'none' to skip all, or press Enter for all): "
+        ).strip()
+        if lang_ans.lower() == "none":
+            args.noLanguage = True
+        elif lang_ans:
+            args.lang = [lang_ans]
+
+        bonus_ans = input("Skip optional bonus files (soundtracks, artbooks, videos)? [Y/n]: ").strip().lower()
+        if bonus_ans in ("", "y", "yes"):
+            args.noBonus = True
+
+        upd_ans = input("Also extract Game Update / Patch links if available? [y/N]: ").strip().lower()
+        if upd_ans in ("y", "yes"):
+            args.updates = True
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+
+def _run_interactive_wizard(args, output_dir: str) -> list[tuple[str, str, str, list[str]]] | None:
+    """
+    Friendly interactive menu shown when the user runs `python app.py` without CLI flags.
+    Returns any direct checkpoint jobs selected, or populates `args` and returns `[]`.
+    Returns `None` if the user chose to exit.
+    """
+    print("\nHow would you like to get your download links?")
+    print(f"  {CLIUI.YELLOW}[1]{CLIUI.RESET} Search for a game on FitGirl Repacks")
+    print(f"  {CLIUI.YELLOW}[2]{CLIUI.RESET} Paste one or more FitGirl game URLs")
+    print(f"  {CLIUI.YELLOW}[3]{CLIUI.RESET} Load links from a .txt file")
+    print(f"  {CLIUI.YELLOW}[4]{CLIUI.RESET} Resume a previous download from saved progress")
+    print(f"  {CLIUI.YELLOW}[0]{CLIUI.RESET} Exit")
+
+    try:
+        choice = input("\nChoose an option (0-4): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+    if choice in ("0", "q", "quit", "exit", ""):
+        CLIUI.info("Goodbye!")
+        return None
+
+    if choice == "1":
+        try:
+            q = input("Enter game name to search: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not q:
+            CLIUI.warn("No search keyword entered.")
+            return None
+        args.search = [q]
+        _prompt_filter_preferences(args)
+        return []
+
+    if choice == "2":
+        try:
+            raw_u = input("Paste FitGirl URL(s) (separate multiple URLs with spaces or commas): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not raw_u:
+            CLIUI.warn("No URL entered.")
+            return None
+        args.url = [raw_u]
+        _prompt_filter_preferences(args)
+        return []
+
+    if choice == "3":
+        try:
+            fpath = input("Enter path to your .txt file: ").strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not fpath:
+            CLIUI.warn("No file path entered.")
+            return None
+        args.file = [fpath]
+        return []
+
+    if choice == "4":
+        args.resume = True
+        saved = _list_resumable_checkpoints(output_dir)
+        if not saved:
+            CLIUI.warn("No saved progress found in 'output/.cache/'.")
+            try:
+                raw_u = input("Paste the FitGirl URL you want to resume (or press Enter to cancel): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            if not raw_u:
+                return None
+            args.url = [raw_u]
+            return []
+
+        print("\nSaved downloads:")
+        for idx, item in enumerate(saved, 1):
+            status_tag = (
+                "Completed" if item["done_count"] == item["total_count"]
+                else f"{item['done_count']}/{item['total_count']} files ready"
+            )
+            print(f"  {CLIUI.YELLOW}[{idx}]{CLIUI.RESET} {item['job_stem']} ({status_tag}) — {item['source']}")
+
+        try:
+            sel = input(f"\nSelect number(s) to resume (1-{len(saved)}, or 'all'): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        chosen = parse_search_selection(sel, len(saved))
+        if not chosen:
+            CLIUI.info("Resume cancelled.")
+            return None
+
+        resumed_jobs: list[tuple[str, str, str, list[str]]] = []
+        for i in chosen:
+            c = saved[i]
+            resumed_jobs.append((c["job_stem"], c["desired_txt"], c["source"], c["all_links"]))
+        return resumed_jobs
+
+    CLIUI.warn("Invalid menu option.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main Entrypoint
+# ---------------------------------------------------------------------------
+
 async def async_main():
     parser = argparse.ArgumentParser(
-        description='Generate direct download links from FitGirl repacks & FuckingFast (Async & Multi-URL)'
+        description='FitGirl Direct Link Generator — Fast, automatic direct download links for IDM & JDownloader'
     )
     parser.add_argument(
         '--url', '-u',
@@ -510,19 +948,19 @@ async def async_main():
         '--concurrency', '-c',
         type=int,
         default=DEFAULT_CONCURRENCY,
-        help=f'Number of parallel browser tabs for async link extraction (default: {DEFAULT_CONCURRENCY})',
+        help=f'Number of parallel downloads to process at once (default: {DEFAULT_CONCURRENCY})',
     )
     parser.add_argument(
         '--lang', '-l',
         nargs='+',
         action='extend',
         type=str,
-        help='Keep only specific selective language(s), e.g. --lang english or --lang english,japanese',
+        help='Keep only specific language pack(s), e.g. --lang english or --lang english,japanese',
     )
     parser.add_argument(
         '--resume', '-r',
         action='store_true',
-        help='Resume from saved checkpoint cache and skip already resolved part links',
+        help='Resume from saved progress and only fetch remaining files',
     )
     parser.add_argument(
         '--updates', '-U',
@@ -532,33 +970,57 @@ async def async_main():
     parser.add_argument(
         '--updatesOnly',
         action='store_true',
-        help='Extract ONLY Game Update / Patch links (<game>_updates.txt) and skip main repack files',
+        help='Extract ONLY Game Update / Patch links (<game>_updates.txt) and skip main game files',
     )
     parser.add_argument(
         '--noBonus',
         action='store_true',
-        help='Exclude bonus content links (files containing "fg-optional")',
+        help='Skip optional bonus content (soundtracks, artbooks, videos)',
     )
     parser.add_argument(
         '--noLanguage',
         action='store_true',
-        help='Exclude all selective language links (files containing "fg-selective")',
+        help='Skip all selective language packs',
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Show detailed technical logs for troubleshooting',
     )
     args = parser.parse_args()
 
-    if not args.url and not args.file and not args.search:
-        parser.error("At least one of --url, --file, or --search must be specified.")
+    set_verbose_logging(args.verbose)
+    CLIUI.banner()
 
     if args.concurrency < 1:
-        parser.error("--concurrency must be at least 1.")
+        CLIUI.error("--concurrency must be at least 1.")
+        return
+
+    output_dir = os.path.join(os.getcwd(), "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    wizard_jobs: list[tuple[str, str, str, list[str]]] = []
+    # Launch interactive wizard if user ran `python app.py` with no input arguments
+    if not args.url and not args.file and not args.search:
+        if sys.stdin.isatty():
+            wizard_res = await asyncio.to_thread(_run_interactive_wizard, args, output_dir)
+            if wizard_res is None:
+                return
+            wizard_jobs.extend(wizard_res)
+        else:
+            parser.error("At least one of --url, --file, or --search must be specified.")
 
     allowed_langs = _parse_lang_inputs(args.lang)
     if allowed_langs:
-        print(f"Language filter active: keeping selective language(s) -> {', '.join(allowed_langs)}")
+        CLIUI.info(f"Language filter: keeping only {', '.join(allowed_langs)}")
+    elif args.noLanguage:
+        CLIUI.info("Language filter: skipping all selective language packs")
+
+    if args.noBonus:
+        CLIUI.info("Bonus filter: skipping optional bonus files")
 
     fitgirl_urls: list[str] = []
     seen_fitgirl_urls: set[str] = set()
-    # Each job is (job_stem, output_filename_stem, source_desc, sorted_links)
     direct_batches: list[tuple[str, str, str, list[str]]] = []
 
     def _add_fitgirl_url(u: str):
@@ -595,7 +1057,7 @@ async def async_main():
             direct_batches.append((
                 "fitgirl_links",
                 "fitgirl_links.txt",
-                "CLI direct links",
+                "Direct CLI Links",
                 sort_fuckingfast_links(filtered_cli),
             ))
 
@@ -603,9 +1065,9 @@ async def async_main():
     if args.file:
         for filepath in args.file:
             if not os.path.isfile(filepath):
-                print(f"File not found, skipping: {filepath}")
+                CLIUI.warn(f"File not found, skipping: {filepath}")
                 continue
-            print(f"Reading links from file: {filepath}")
+            CLIUI.info(f"Reading links from file: {filepath}")
             file_ff_links: list[str] = []
             with open(filepath, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -626,7 +1088,6 @@ async def async_main():
                     allowed_langs=allowed_langs,
                 )
                 raw_stem = _sanitize_filename(os.path.splitext(os.path.basename(filepath))[0])
-                # If user passed a *_failed.txt file, strip _failed suffix for output
                 if raw_stem.endswith("_failed"):
                     raw_stem = raw_stem[:-7] or "fitgirl"
                 out_txt = f"{raw_stem}.txt" if raw_stem.endswith(("_links", "_updates")) else f"{raw_stem}_links.txt"
@@ -635,14 +1096,14 @@ async def async_main():
                     direct_batches.append((
                         job_stem,
                         out_txt,
-                        f"File: {filepath}",
+                        os.path.basename(filepath),
                         sort_fuckingfast_links(filtered_ff),
                     ))
 
     # 3. Scrape FitGirl repack pages concurrently (preserving URL order)
-    jobs: list[tuple[str, str, str, list[str]]] = []
+    jobs: list[tuple[str, str, str, list[str]]] = list(wizard_jobs)
     if fitgirl_urls:
-        print(f"Fetching {len(fitgirl_urls)} FitGirl repack page(s)...")
+        CLIUI.info(f"Checking {len(fitgirl_urls)} FitGirl game page(s) for download links...")
         scraped_pages = await asyncio.gather(
             *(
                 asyncio.to_thread(
@@ -659,29 +1120,29 @@ async def async_main():
             slug = _slug_from_url(u)
             if not args.updatesOnly:
                 if main_links:
-                    jobs.append((f"{slug}_links", f"{slug}_links.txt", u, main_links))
+                    CLIUI.success(f"Found {len(main_links)} main file(s) for '{slug}'")
+                    jobs.append((f"{slug}_links", f"{slug}_links.txt", slug, main_links))
                 else:
-                    print(f"No main FuckingFast links found on: {u}")
+                    CLIUI.warn(f"No main FuckingFast links found on: {u}")
 
             if args.updates or args.updatesOnly:
                 if update_links:
+                    CLIUI.success(f"Found {len(update_links)} update/patch file(s) for '{slug}'")
                     jobs.append((
                         f"{slug}_updates",
                         f"{slug}_updates.txt",
-                        f"{u} [Game Updates]",
+                        f"{slug} (Game Updates)",
                         update_links,
                     ))
                 else:
-                    print(f"No FuckingFast game update links found on: {u}")
+                    CLIUI.warn(f"No FuckingFast update/patch links found on: {u}")
 
     jobs.extend(direct_batches)
 
     if not jobs:
-        print("No FuckingFast links found to process.")
+        CLIUI.warn("No download links found to process.")
         return
 
-    output_dir = os.path.join(os.getcwd(), "output")
-    os.makedirs(output_dir, exist_ok=True)
     used_filenames: set[str] = set()
 
     def _allocate_output_paths(job_stem: str, desired_txt: str) -> tuple[str, str, str]:
@@ -702,20 +1163,26 @@ async def async_main():
     total_jobs = len(jobs)
     summary_rows: list[tuple[str, int, int, str]] = []
 
-    print(
-        f"\nStarting async browser extraction across {total_jobs} target(s) "
-        f"(concurrency={args.concurrency}, resume={args.resume})..."
+    CLIUI.info(
+        f"Starting automatic link extractor ({args.concurrency} parallel workers)..."
     )
 
     try:
         async with FuckingFastBatchExtractor(concurrency=args.concurrency) as extractor:
             for job_idx, (job_stem, desired_txt, source_desc, links) in enumerate(jobs, 1):
-                print(f"\n[{job_idx}/{total_jobs}] Target: {source_desc}")
+                CLIUI.section(f"Target [{job_idx}/{total_jobs}]: {source_desc}")
                 output_file, failed_file, ckpt_file = _allocate_output_paths(job_stem, desired_txt)
 
-                # Always load existing checkpoint so incremental saves preserve prior entries;
-                # only skip already-resolved links when --resume is enabled.
+                # Load existing checkpoint so incremental saves preserve prior entries
                 checkpoint_map: dict[str, str] = _load_checkpoint(ckpt_file)
+                _save_checkpoint(
+                    ckpt_file,
+                    source_desc,
+                    checkpoint_map,
+                    all_links=links,
+                    job_stem=job_stem,
+                    desired_txt=desired_txt,
+                )
 
                 pending_indices: list[int] = []
                 pending_links: list[str] = []
@@ -728,24 +1195,34 @@ async def async_main():
 
                 cached_count = len(links) - len(pending_links)
                 if args.resume and cached_count > 0:
-                    print(
-                        f"Resuming from checkpoint: {cached_count}/{len(links)} link(s) already resolved, "
-                        f"{len(pending_links)} remaining..."
-                    )
-                else:
-                    print(f"Extracting {len(links)} ordered part/file link(s)...")
+                    if pending_links:
+                        CLIUI.info(
+                            f"Resuming saved progress: {cached_count} of {len(links)} file(s) already done. "
+                            f"Fetching the remaining {len(pending_links)} file(s)..."
+                        )
+                    else:
+                        CLIUI.success(f"All {len(links)} file(s) were already completed in your saved progress!")
 
                 def _on_link_resolved(src_l: str, direct_l: str):
                     clean_key = src_l.split('#', 1)[0].strip()
                     checkpoint_map[clean_key] = direct_l
-                    _save_checkpoint(ckpt_file, source_desc, checkpoint_map)
+                    _save_checkpoint(
+                        ckpt_file,
+                        source_desc,
+                        checkpoint_map,
+                        all_links=links,
+                        job_stem=job_stem,
+                        desired_txt=desired_txt,
+                    )
 
                 extracted_pending: dict[int, str] = {}
                 if pending_links:
-                    pending_results = await extractor.process_links(
-                        pending_links,
-                        on_progress=_on_link_resolved,
-                    )
+                    with LiveExtractionProgress(total=len(links), initial_completed=cached_count) as progress_ui:
+                        pending_results = await extractor.process_links(
+                            pending_links,
+                            on_progress=_on_link_resolved,
+                            on_status=progress_ui.on_status,
+                        )
                     for orig_idx, res in zip(pending_indices, pending_results):
                         extracted_pending[orig_idx] = res
 
@@ -767,43 +1244,48 @@ async def async_main():
                             f.write(f"{direct_link}\n")
                             success_count += 1
                         else:
-                            failed_parts.append((part_num, src_link, str(direct_link)))
+                            failed_parts.append((part_num, src_link, friendly_error_message(str(direct_link))))
 
-                print(f"Completed [{job_idx}/{total_jobs}]: {success_count}/{len(links)} direct links saved.")
-                print(f"Saved to: {output_file}")
+                if success_count == len(links):
+                    CLIUI.success(f"Done! All {success_count}/{len(links)} direct download link(s) are ready.")
+                else:
+                    CLIUI.warn(f"Finished: {success_count} of {len(links)} direct download link(s) saved.")
+                CLIUI.info(f"Saved to: {output_file}")
 
                 if failed_parts:
                     with open(failed_file, 'w', encoding='utf-8') as ff:
                         for _, src_link, _ in failed_parts:
                             ff.write(f"{src_link}\n")
-                    print(f"Warning - {len(failed_parts)} part(s) failed to resolve:")
+                    CLIUI.warn(f"{len(failed_parts)} file(s) could not be fetched right now:")
                     for part_num, src_link, reason in failed_parts:
-                        print(f"  - Part #{part_num}: {src_link} ({reason})")
-                    print(f"Failed source links saved to: {failed_file}")
-                    print("Tip: Re-run with --resume (or --file <failed_file>) to retry only failed parts.")
+                        short_name = format_part_label(src_link)
+                        print(f"    • Part #{part_num} ({short_name}) — {reason}")
+                    CLIUI.info(f"Missing links saved to: {failed_file}")
+                    CLIUI.info("Tip: Run again with --resume to retry only the missing file(s).")
                 else:
                     if os.path.isfile(failed_file):
                         try:
                             os.remove(failed_file)
-                            print(f"Cleaned up previous failed-links file: {failed_file}")
                         except OSError:
                             pass
 
                 summary_rows.append((source_desc, success_count, len(links), output_file))
 
-        if total_jobs > 1:
-            print("\n=== Batch Summary ===")
-            for source_desc, ok_cnt, total_cnt, out_path in summary_rows:
-                print(f"- {source_desc}: {ok_cnt}/{total_cnt} -> {out_path}")
+        CLIUI.summary_table(summary_rows)
+        CLIUI.idm_guide_box()
 
-        print("\nReady for IDM import: Tasks -> Import -> From text file")
-
+    except KeyboardInterrupt:
+        print()
+        CLIUI.warn("Process interrupted by user. Your progress has been saved — run with --resume to continue!")
     except Exception as e:
-        print(f"Error processing links: {e}")
+        CLIUI.error(f"Something went wrong: {friendly_error_message(str(e))}")
 
 
 def main():
-    asyncio.run(async_main())
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

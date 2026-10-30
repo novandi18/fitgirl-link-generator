@@ -8,7 +8,15 @@ import logging
 import re
 import requests as req
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Keep default logging quiet (WARNING+) so CLI output stays clean for normal users.
+# Detailed logs can be enabled via `set_verbose_logging(True)`.
+logger = logging.getLogger("fitgirl_extractor")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(_handler)
+logger.setLevel(logging.WARNING)
+logger.propagate = False
 
 # Matches both fuckingfast.co/dl/ and dl.fuckingfast.co/dl/
 DOWNLOAD_LINK_PATTERN = re.compile(r'window\.open\(["\'](https://[^"\']*fuckingfast\.co/dl/[^"\']+)["\']')
@@ -28,6 +36,57 @@ USER_AGENT = (
 class RateLimitedException(Exception):
     """Custom exception for rate limiting detection"""
     pass
+
+
+def set_verbose_logging(verbose: bool = False):
+    """Enable or disable detailed technical logging."""
+    logger.setLevel(logging.INFO if verbose else logging.WARNING)
+
+
+def format_part_label(url_or_label: str, max_len: int = 48) -> str:
+    """
+    Convert a raw FuckingFast URL or FitGirl fragment into a short, human-friendly filename.
+    Example: 'https://.../abc#Planet_Zoo_2_--_fitgirl-repacks.site_--.part01.rar'
+             -> 'Planet_Zoo_2.part01.rar'
+    """
+    raw = url_or_label.split('#', 1)[1].strip() if '#' in url_or_label else url_or_label.strip()
+    if not raw:
+        raw = url_or_label.strip()
+
+    # Remove noisy FitGirl watermark tokens from display name
+    cleaned = re.sub(r'_?--_?fitgirl-repacks\.site_?--_?', '', raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r'fitgirl-repacks\.site', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'_{2,}', '_', cleaned).strip('_. ')
+    if not cleaned:
+        cleaned = raw
+
+    if len(cleaned) > max_len:
+        head = max_len - 19
+        cleaned = f"{cleaned[:head]}...{cleaned[-16:]}"
+    return cleaned
+
+
+def friendly_error_message(error_str: str) -> str:
+    """Translate technical browser/network errors into simple English for end users."""
+    if not error_str:
+        return "Unknown error occurred"
+    lower = error_str.lower()
+    if "rate limit" in lower or "429" in lower or "too many requests" in lower:
+        return "Server was too busy (rate limit reached)"
+    if error_str == "Download link not found" or "not found" in lower:
+        return "Download button was not found on the host page"
+    if "timeout" in lower or "timed out" in lower:
+        return "Page took too long to respond (connection timeout)"
+    if "net::err_" in lower or "connection" in lower or "disconnected" in lower:
+        return "Internet connection was interrupted"
+    if "target page, context or browser has been closed" in lower:
+        return "Browser tab closed unexpectedly"
+
+    # Strip verbose Playwright call logs if present
+    first_line = error_str.splitlines()[0].strip()
+    if first_line.startswith("Error:"):
+        first_line = first_line[6:].strip()
+    return first_line[:100]
 
 
 def is_valid_direct_link(link: str | None) -> bool:
@@ -59,9 +118,6 @@ def sort_fuckingfast_links(links: list[str]) -> list[str]:
             seen.add(base)
             unique_links.append(link.strip())
 
-    # Track the first appearance index of each base archive name so distinct archives
-    # (e.g. sequential game updates) stay in their chronological order while their
-    # individual parts (.part1.rar, .part2.rar, ...) are sorted numerically.
     base_first_seen: dict[tuple[int, str], int] = {}
 
     def _parse_fragment_meta(idx: int, url: str):
@@ -92,7 +148,6 @@ def sort_fuckingfast_links(links: list[str]) -> list[str]:
             base_first_seen[group_key] = idx
         group_order = base_first_seen[group_key]
 
-        # Tuple-tag ints vs strings to prevent TypeError during comparison in Python 3
         natural_parts = [
             (0, int(tok)) if tok.isdigit() else (1, tok)
             for tok in re.split(r'(\d+)', lower_frag)
@@ -101,7 +156,6 @@ def sort_fuckingfast_links(links: list[str]) -> list[str]:
         return (category, group_order, part_num, natural_parts, idx)
 
     indexed = list(enumerate(unique_links))
-    # Pre-populate base_first_seen in original order
     keys = {i: _parse_fragment_meta(i, u) for i, u in indexed}
     indexed.sort(key=lambda item: keys[item[0]])
     return [url for _, url in indexed]
@@ -150,11 +204,9 @@ async def extract_download_link_from_page(page, url: str) -> str:
 
     def handle_download(download):
         _set_found(download.url)
-        # Cancel browser file transfer immediately; we only need the direct URL
         asyncio.create_task(_safe_cancel_download(download))
 
     def handle_popup(popup):
-        # Auto-close ads and popunders immediately
         asyncio.create_task(_safe_close_popup(popup))
 
     def on_response(response):
@@ -181,7 +233,6 @@ async def extract_download_link_from_page(page, url: str) -> str:
         except Exception:
             if found_link:
                 return found_link
-            # If load timed out due to slow third-party ad assets, continue if DOM exists
             has_dom = await page.evaluate("() => Boolean(document.body)")
             if not has_dom:
                 raise
@@ -191,20 +242,15 @@ async def extract_download_link_from_page(page, url: str) -> str:
         if found_link:
             return found_link
 
-        # Check for rate limiting
         body_text = await page.evaluate("() => document.body ? document.body.textContent : ''")
         if any(kw in body_text.lower() for kw in RATE_LIMIT_KEYWORDS):
             raise RateLimitedException("Rate limiting detected")
 
-        # Fast check: older mirror using window.open in HTML source
         html_content = await page.content()
         match = DOWNLOAD_LINK_PATTERN.search(html_content)
         if match:
             return match.group(1)
 
-        # Handle the modern HTMX 2-click pattern:
-        # Click 1: triggers ad popup (auto-closed by popup listener)
-        # Click 2: triggers HTMX POST to /f/<id>/go returning HX-Redirect
         btn = page.locator('a:has-text("DOWNLOAD"), button:has-text("DOWNLOAD")')
         if await btn.count() > 0:
             await btn.first.click(timeout=5000)
@@ -227,7 +273,6 @@ async def extract_download_link_from_page(page, url: str) -> str:
         if found_link:
             return found_link
 
-        # Re-check rate limit in case HTMX injected a rate-limit message
         body_text_after = await page.evaluate("() => document.body ? document.body.textContent : ''")
         if any(kw in body_text_after.lower() for kw in RATE_LIMIT_KEYWORDS):
             raise RateLimitedException("Rate limiting detected after click")
@@ -330,11 +375,13 @@ class FuckingFastBatchExtractor:
         self,
         links: list[str],
         on_progress: Callable[[str, str], None] | None = None,
+        on_status: Callable[[str, int, int, str], None] | None = None,
     ) -> list[str]:
         """
         Extract direct download URLs concurrently across pooled tabs.
         Returns results strictly aligned with the input `links` order.
-        Optionally calls `on_progress(source_link, direct_link)` on each resolved link.
+        - `on_progress(source_link, direct_link)`: called when a link resolves successfully.
+        - `on_status(event, part_number, total_parts, message)`: called on status changes for UI updates.
         """
         if not links:
             return []
@@ -343,76 +390,92 @@ class FuckingFastBatchExtractor:
         total = len(links)
         completed = 0
 
+        def _emit_status(event: str, part_num: int, msg: str):
+            if on_status is not None:
+                try:
+                    on_status(event, part_num, total, msg)
+                except Exception:
+                    pass
+
         async def _process_one(idx: int, link: str) -> str:
             nonlocal completed
-            label = link.split('#', 1)[1] if '#' in link else link
+            part_num = idx + 1
+            short_label = format_part_label(link)
             page = await self._page_queue.get()
 
             try:
-                # Slight stagger to prevent simultaneous burst requests
                 await asyncio.sleep(random.uniform(0.15, 0.5))
 
                 for attempt in range(self.max_retries + 1):
                     try:
-                        logging.info(f"[Part {idx + 1}/{total}] Extracting: {label}")
+                        _emit_status("start", part_num, short_label)
+                        logger.info(f"[Part {part_num}/{total}] Extracting: {short_label}")
                         direct = await extract_download_link_from_page(page, link)
                         page = await self._reset_or_replace_page(page)
 
                         if is_valid_direct_link(direct):
                             completed += 1
-                            logging.info(f"[{completed}/{total} done] Part {idx + 1} OK: {label}")
+                            logger.info(f"[{completed}/{total} done] Part {part_num} OK: {short_label}")
                             if on_progress is not None:
                                 try:
                                     on_progress(link, direct)
                                 except Exception as cb_err:
-                                    logging.debug(f"Progress callback error: {cb_err}")
+                                    logger.debug(f"Progress callback error: {cb_err}")
+                            _emit_status("done", part_num, short_label)
                             return direct
 
                         if attempt < self.max_retries:
                             delay = (2 ** (attempt + 1)) + random.uniform(0.5, 1.5)
-                            logging.warning(
-                                f"[Part {idx + 1}/{total}] Link not found for {label}. "
-                                f"Retrying ({attempt + 1}/{self.max_retries}) in {delay:.1f}s..."
+                            retry_msg = (
+                                f"Retrying {short_label} ({attempt + 1}/{self.max_retries}) in {delay:.0f}s..."
                             )
+                            _emit_status("retry", part_num, retry_msg)
+                            logger.info(f"[Part {part_num}/{total}] {retry_msg}")
                             await asyncio.sleep(delay)
                         else:
                             completed += 1
-                            logging.error(f"[{completed}/{total} done] Part {idx + 1} FAILED (not found): {label}")
+                            _emit_status("failed", part_num, f"{short_label} (link not found)")
+                            logger.warning(f"[{completed}/{total} done] Part {part_num} failed: {short_label}")
                             return "Download link not found"
 
                     except RateLimitedException:
                         page = await self._reset_or_replace_page(page)
                         if attempt < self.max_retries:
                             delay = (2 ** (attempt + 1)) + random.uniform(1.5, 3.0)
-                            logging.warning(
-                                f"[Part {idx + 1}/{total}] Rate limited on {label}. "
-                                f"Retrying ({attempt + 1}/{self.max_retries}) in {delay:.1f}s..."
+                            wait_msg = (
+                                f"Server is busy — waiting {delay:.0f}s before retrying "
+                                f"{short_label} ({attempt + 1}/{self.max_retries})..."
                             )
+                            _emit_status("rate_limit", part_num, wait_msg)
+                            logger.info(f"[Part {part_num}/{total}] {wait_msg}")
                             await asyncio.sleep(delay)
                         else:
                             completed += 1
-                            logging.error(f"[{completed}/{total} done] Part {idx + 1} FAILED (rate limit): {label}")
+                            _emit_status("failed", part_num, f"{short_label} (server busy)")
+                            logger.warning(f"[{completed}/{total} done] Part {part_num} rate limit max retries: {short_label}")
                             return "Rate limit error - max retries reached"
 
                     except Exception as e:
                         page = await self._reset_or_replace_page(page)
+                        friendly_err = friendly_error_message(str(e))
                         if attempt < self.max_retries:
                             delay = (2 ** (attempt + 1)) + random.uniform(0.5, 1.5)
-                            logging.warning(
-                                f"[Part {idx + 1}/{total}] Error on {label}: {e}. "
-                                f"Retrying ({attempt + 1}/{self.max_retries}) in {delay:.1f}s..."
+                            retry_msg = (
+                                f"{friendly_err} — retrying {short_label} ({attempt + 1}/{self.max_retries})..."
                             )
+                            _emit_status("retry", part_num, retry_msg)
+                            logger.info(f"[Part {part_num}/{total}] {retry_msg}")
                             await asyncio.sleep(delay)
                         else:
                             completed += 1
-                            logging.error(f"[{completed}/{total} done] Part {idx + 1} FAILED: {label} -> {e}")
-                            return f"Error: {e}"
+                            _emit_status("failed", part_num, f"{short_label} ({friendly_err})")
+                            logger.warning(f"[{completed}/{total} done] Part {part_num} failed: {short_label} -> {friendly_err}")
+                            return f"Error: {friendly_err}"
 
                 return "Failed after multiple attempts"
             finally:
                 self._page_queue.put_nowait(page)
 
-        # asyncio.gather guarantees the returned list preserves the exact order of `links`
         results = await asyncio.gather(*(_process_one(i, link) for i, link in enumerate(links)))
         return list(results)
 
@@ -472,14 +535,15 @@ async def get_final_download_fuckingfast_async(url: str, max_retries: int = 3) -
             except RateLimitedException:
                 retry_count += 1
                 if retry_count <= max_retries:
-                    logging.info(f"Rate limited on {url}. Retrying ({retry_count}/{max_retries})...")
+                    logger.info(f"Rate limited on {url}. Retrying ({retry_count}/{max_retries})...")
                 else:
-                    logging.error(f"Max retries reached for {url}")
+                    logger.warning(f"Max retries reached for {url}")
                     return "Rate limit error - max retries reached"
 
             except Exception as e:
-                logging.error(f"Error extracting download link for {url}: {str(e)}")
-                return f"Error: {str(e)}"
+                friendly_err = friendly_error_message(str(e))
+                logger.warning(f"Error extracting download link for {url}: {friendly_err}")
+                return f"Error: {friendly_err}"
 
         return "Failed after multiple attempts"
 
@@ -489,6 +553,7 @@ async def process_fuckingfast_links_batch(
     concurrency: int = DEFAULT_CONCURRENCY,
     max_retries: int = 3,
     on_progress: Callable[[str, str], None] | None = None,
+    on_status: Callable[[str, int, int, str], None] | None = None,
 ) -> list[str]:
     """
     Concurrent batch processor that reuses a single stealth browser session
@@ -498,4 +563,4 @@ async def process_fuckingfast_links_batch(
         return []
 
     async with FuckingFastBatchExtractor(concurrency=concurrency, max_retries=max_retries) as extractor:
-        return await extractor.process_links(links, on_progress=on_progress)
+        return await extractor.process_links(links, on_progress=on_progress, on_status=on_status)
