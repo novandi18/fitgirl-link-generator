@@ -6,15 +6,16 @@ A high-performance Python tool that extracts and processes FitGirl Repack links 
 
 * **Cloudflare Turnstile & Bot Management Support**: Bypasses Cloudflare checks using automated Playwright stealth profiles.
 * **Modern HTMX & 2-Click Ad Handling**: Fully supports FuckingFast's updated HTMX architecture (`hx-post="/f/<id>/go"`), automatically closing ad popups on the first click and capturing the direct download stream and `HX-Redirect` header on the second click.
-* **Session Reuse Batch Processing**: Reuses a single browser session context across all files to eliminate redundant Cloudflare verifications and prevent IP rate-limiting.
-* **Batch Text File Input**: Added support for `--file` flag to process custom lists of FuckingFast URLs directly.
+* **Session Reuse & Concurrent Tab Pool**: Reuses a single stealth browser context with configurable parallel tabs (`--concurrency`) to extract multiple part files asynchronously while strictly preserving part order.
+* **Multiple URLs & Batch Text File Input**: Supports passing multiple FitGirl repack URLs via `--url` (or inside `--file`) as well as custom lists of FuckingFast URLs.
 
 ## Features
 
-- Automatically extracts FuckingFast download links from FitGirl repack pages or custom URL text files
+- Automatically extracts FuckingFast download links from one or multiple FitGirl repack pages or custom URL text files
+- Async parallel extraction across pooled browser tabs while keeping part files strictly in order (`part1`, `part2`, ..., `partN`)
 - Bypasses Cloudflare Turnstile, link shorteners, and ad popunders
 - Generates direct, resumable download links compatible with IDM and JDownloader
-- Organizes direct links in an IDM-ready text file
+- Organizes direct links in IDM-ready text files per game
 - Works with single files, multi-part RAR archives, optional bonus files, and selective languages
 - Smart rate-limiting detection and retry backoff
 
@@ -50,38 +51,44 @@ playwright install chromium
 
 ## Usage
 
-### 1. From a FitGirl Repack Page URL
-Run the script with the URL of any FitGirl repack:
+### 1. From One or More FitGirl Repack Page URLs
+Run the script with one or multiple FitGirl repack URLs (separated by spaces or commas):
 
 ```bash
-python app.py --url https://fitgirl-repacks.site/game-name/
+# Single URL
+python app.py --url https://fitgirl-repacks.site/planet-zoo-2/
+
+# Multiple URLs + custom async concurrency
+python app.py --url https://fitgirl-repacks.site/planet-zoo-2/ https://fitgirl-repacks.site/elden-ring/ --concurrency 4
 ```
 
 **Options:**
-- `--url` [String]: The URL of the FitGirl repack page.
+- `--url`, `-u` [Strings]: One or more FitGirl repack page URLs (space or comma separated).
+- `--file`, `-f` [Paths]: Path(s) to text file(s) containing FitGirl repack URLs or FuckingFast links (one per line).
+- `--concurrency`, `-c` [Int]: Number of parallel browser tabs for async link extraction (default: `3`).
 - `--noBonus` [Flag]: Exclude bonus content links (`fg-optional*`).
 - `--noLanguage` [Flag]: Exclude selective language packs (`fg-selective*`).
 
 Example:
 ```bash
-python app.py --url https://fitgirl-repacks.site/game-name/ --noBonus --noLanguage
+python app.py --url https://fitgirl-repacks.site/game-1/ https://fitgirl-repacks.site/game-2/ --noBonus --noLanguage -c 3
 ```
 
 ### 2. From a Text File of URLs
-If you already have a list of FuckingFast links:
+Your text file can contain multiple FitGirl repack page URLs, direct FuckingFast links, or both:
 
 ```bash
 python app.py --file my_links.txt
 ```
 
-The script will resolve all direct download links and save them to `output/<name>_links.txt`.
+Each game/target will have its direct download links saved in strict part order to `output/<name>_links.txt`.
 
 ## How to Import into IDM
 
 1. Open **Internet Download Manager (IDM)**.
-2. Go to **Tasks** $\rightarrow$ **Import** $\rightarrow$ **From text file**.
+2. Go to **Tasks** -> **Import** -> **From text file**.
 3. Select the generated text file in the `output/` directory.
-4. Click **Check All** $\rightarrow$ **OK** $\rightarrow$ Start Queue.
+4. Click **Check All** -> **OK** -> Start Queue.
 
 ## License
 
